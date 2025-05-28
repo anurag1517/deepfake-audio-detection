@@ -80,9 +80,15 @@ def extract_features(file_path):
 
 # To Run inference using the model
 def run_inference(file_path):
+    #for pi4
+    '''
+    import tflite_runtime.interpreter as tflite
+    interpreter = tflite.Interpreter(model_path="model.tflite")
+    interpreter.allocate_tensors()
+    '''
     
+    #for windows 
     from tensorflow.lite.python.interpreter import Interpreter
-
     interpreter = Interpreter(model_path="model.tflite")
     interpreter.allocate_tensors()
 
