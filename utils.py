@@ -6,22 +6,31 @@ from scipy.stats import entropy
 from pywt import WaveletPacket
 import joblib
 import pandas as pd
+import logging
+import tensorflow as tf
+import os
 
-# Loading the scaler from a file
-scaler =joblib.load('robust_scaler.pkl')
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 
-# Loading and Normalize Audio
+# Load the scaler and transformer
+scaler = joblib.load('robust_scaler1.pkl')
+transformer = joblib.load('yeo_johnson_transform.pkl')
+
+# Load and Normalize Audio
 def load_audio(filename):
-    y, sr = librosa.load(filename, sr=16000)  # Use consistent sampling rate
-    y = y / np.max(np.abs(y))
+    y, sr = librosa.load(filename, sr=16000)
+    logging.info(f"Loaded audio: shape={y.shape}, dtype={y.dtype}, min={y.min()}, max={y.max()}, sr={sr}")
+    if np.max(np.abs(y)) > 0:
+        y = y / np.max(np.abs(y))
     return sr, y
 
-# mpirical Wavelet Transform (EWT)
+# Empirical Wavelet Transform
 def ewt_decompose(signal):
     coeffs = pywt.wavedec(signal, 'db4', level=4)
     return coeffs
 
-# Wavelet Packet Transform (WPT)
+# Wavelet Packet Transform
 def wpt_decompose(signal, wavelet='db4', level=3):
     wp = WaveletPacket(data=signal, wavelet=wavelet, maxlevel=level)
     nodes = [node.path for node in wp.get_level(level)]
@@ -36,7 +45,7 @@ def extract_wavelet_features(ewt_coeffs, wpt_coeffs):
         features += [np.mean(coeff), np.var(coeff), entropy(np.abs(coeff) + 1e-10)]
     return features
 
-# Spectral Feature (MFCC Consistency)
+# Spectral Feature
 def extract_spectral_feature(y, sr):
     mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
     return 1 - np.std(mfcc) / np.mean(mfcc)
@@ -47,71 +56,70 @@ def extract_pitch_variation(y, sr):
     valid = pitches[magnitudes > np.median(magnitudes)]
     return np.std(valid) / np.mean(valid) if len(valid) > 0 and np.mean(valid) > 0 else 0
 
-# Process 
+# Full Feature Extraction Pipeline
 def extract_features(file_path):
     try:
         sr, y = load_audio(file_path)
-
         if y is None or len(y) == 0 or np.all(y == 0):
             raise ValueError("Audio file is empty or silent.")
-
         ewt_coeffs = ewt_decompose(y)
         wpt_coeffs = wpt_decompose(y)
         wavelet_feats = extract_wavelet_features(ewt_coeffs, wpt_coeffs)
         spectral_feat = extract_spectral_feature(y, sr)
         pitch_var = extract_pitch_variation(y, sr)
-
         feature_list = [spectral_feat, pitch_var] + wavelet_feats
         feature_vector = np.array(feature_list).reshape(1, -1)
-
-        # Use the same feature names as during scaler fitting
-        if hasattr(scaler, 'feature_names_in_'):
-            col_names = scaler.feature_names_in_
-            feature_df = pd.DataFrame(feature_vector, columns=col_names)
-            scaled_vector = scaler.transform(feature_df)
-        else:
-            scaled_vector = scaler.transform(feature_vector)
-        return scaled_vector.astype(np.float32)
-
+        return feature_vector.astype(np.float32)
     except Exception as e:
-        print(f"Error extracting features from {file_path}: {e}")
+        logging.exception(f"❌ Feature extraction failed for {file_path}")
         return None
 
-
-# To Run inference using the model
+# Run Inference
 def run_inference(file_path):
-    #for pi4
-    '''
-    import tflite_runtime.interpreter as tflite
-    interpreter = tflite.Interpreter(model_path="model.tflite")
-    interpreter.allocate_tensors()
-    '''
-    
-    #for windows 
-    from tensorflow.lite.python.interpreter import Interpreter
-    interpreter = Interpreter(model_path="model.tflite")
-    interpreter.allocate_tensors()
+    try:
+        # Load TFLite model
+        interpreter = tf.lite.Interpreter(model_path="model.tflite")
+        interpreter.allocate_tensors()
 
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
 
-    features = extract_features(file_path)
-    if features is None:
-        return {"status": "error", "message": "Failed to extract features from audio."}
+        # Feature extraction
+        features = extract_features(file_path)
+        if features is None:
+            return {"status": "error", "message": "Failed to extract features."}
 
-    interpreter.set_tensor(input_details[0]['index'], features)
-    interpreter.invoke()
-    output = interpreter.get_tensor(output_details[0]['index'])
+        # Apply Yeo-Johnson transformation
+        features = transformer.transform(features)
 
-    # Get raw probability
-    prob = float(output[0][0])
+        # Robust scaling
+        if hasattr(scaler, 'feature_names_in_'):
+            col_names = scaler.feature_names_in_
+            feature_df = pd.DataFrame(features, columns=col_names)
+            features_scaled = scaler.transform(feature_df)
+        else:
+            features_scaled = scaler.transform(features)
+        features_scaled = features_scaled.astype(np.float32)
 
-    # Apply threshold
-    predicted_class = 1 if prob > 0.5 else 0
+        # Sanity check for input shape
+        if features_scaled.shape[1] != input_details[0]['shape'][1]:
+            return {"status": "error", "message": f"Feature shape mismatch: {features_scaled.shape[1]} vs model input {input_details[0]['shape'][1]}"}
 
-    return {
-        "status": "success",
-        "prediction": predicted_class,     # 1 = REAL, 0 = FAKE
-        "confidence": prob                 # raw sigmoid output
-    }
+        # Inference
+        interpreter.set_tensor(input_details[0]['index'], features_scaled)
+        interpreter.invoke()
+        output = interpreter.get_tensor(output_details[0]['index'])
 
+        prob = float(output[0][0])
+        predicted_class = 1 if prob > 0.5 else 0
+
+        return {
+            "file": file_path,
+            "status": "success",
+            "label": "Bona fide" if predicted_class == 1 else "Spoof",
+            "prediction": int(predicted_class),
+            "confidence": round(prob if predicted_class else 1 - prob, 4)
+        }
+    except Exception as e:
+        logging.exception("❌ Inference failed")
+        return {"status": "error", "message": f"Model inference failed: {e}"}
